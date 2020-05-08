@@ -17,6 +17,9 @@ namespace AmplitudeSharp.Api
         {
             Success,
             ProxyNeeded,
+            BadData,
+            InvalidApiKey,
+            TooLarge,
             Throttled,
             ServerError,
         }
@@ -25,7 +28,7 @@ namespace AmplitudeSharp.Api
 
         public abstract Task<SendResult> Identify(AmplitudeIdentify identification);
 
-        public abstract Task<SendResult> SendEvents(List<AmplitudeEvent> events);
+        public abstract Task<SendResult> SendEvents(IEnumerable<AmplitudeEvent> events);
     }
 
     class AmplitudeApi : IAmplitudeApi
@@ -34,6 +37,11 @@ namespace AmplitudeSharp.Api
         private HttpClient httpClient;
         private HttpClientHandler httpHandler;
         private readonly JsonSerializerSettings jsonSerializerSettings;
+
+        /// <summary>
+        /// The maximum number of events that can be batched together (as recommended by Amplitude docs).
+        /// </summary>
+        public const int MaxEventBatchSize = 10;
 
         public AmplitudeApi(string apiKey, JsonSerializerSettings jsonSerializerSettings)
         {
@@ -94,13 +102,12 @@ namespace AmplitudeSharp.Api
                         result = SendResult.ServerError;
                     }
                 }
-
             }
 
             return result;
         }
 
-        public async override Task<SendResult> SendEvents(List<AmplitudeEvent> events)
+        public async override Task<SendResult> SendEvents(IEnumerable<AmplitudeEvent> events)
         {
             SendResult result = SendResult.Success;
 
@@ -192,7 +199,7 @@ namespace AmplitudeSharp.Api
                         {
                             if(errorMessage.StartsWith("Invalid API key"))
                             {
-                                // TODO: Return a different exception for API keys
+                                return SendResult.InvalidApiKey;
                             }
                         }
                     }
@@ -202,19 +209,15 @@ namespace AmplitudeSharp.Api
                     }
                     // If we get here, there was something wrong with the data, but its not our API key
                     AmplitudeService.s_logger(LogLevel.Error, $"Amplitude API returned 400 (Bad Request): {responseJson}");
-                    // TODO: Use a non retryable error
-                    return SendResult.ServerError;
+                    return SendResult.BadData;
 
                 // 413
                 case HttpStatusCode.RequestEntityTooLarge:
                     AmplitudeService.s_logger(LogLevel.Error, $"Event data sent to Amplitude exceeded size limit");
-                    // TODO: Use a non retryable error
-                    return SendResult.ServerError;
+                    return SendResult.TooLarge;
 
                 // 429
                 case (HttpStatusCode)429:
-                    // TODO: Test this
-                    // TODO: Do we warn anywhere if we are throttled? Useful to know
                     return SendResult.Throttled;
 
                 // 500, 502, 504

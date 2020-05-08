@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -195,6 +196,8 @@ namespace AmplitudeSharp
             }
             else
             {
+                s_logger(LogLevel.Error, "Must call Identify() before logging events");
+
                 if (Debugger.IsAttached)
                 {
                     throw new InvalidOperationException("Must call Identify() before logging events");
@@ -268,67 +271,103 @@ namespace AmplitudeSharp
         /// </summary>
         private async void UploadThread()
         {
-            const int MaxEventBatch = 10;
+            // Start with this, and we can shrink it if we start hitting size limits
+            int maxEventBatch = AmplitudeApi.MaxEventBatchSize;
 
             try
             {
                 while (true)
                 {
                     await eventsReady.WaitAsync(cancellationToken.Token);
-                    List<AmplitudeEvent> eventsToSend = new List<AmplitudeEvent>();
-                    AmplitudeIdentify identification = null;
+
+                    List<IAmplitudeEvent> apiCallsToSend = new List<IAmplitudeEvent>();
                     bool backOff = false;
 
                     lock (lockObject)
                     {
-                        foreach (IAmplitudeEvent e in eventQueue)
+                        foreach (IAmplitudeEvent ev in eventQueue)
                         {
-                            identification = e as AmplitudeIdentify;
-
-                            if ((identification != null) || (eventsToSend.Count >= MaxEventBatch))
+                            // Events API supports bacthing, so grab a few (stop if we get to an identify - different API)
+                            if ((apiCallsToSend.Count > 0 && ev is AmplitudeIdentify) || (apiCallsToSend.Count >= maxEventBatch))
                             {
                                 break;
                             }
-
-                            eventsToSend.Add((AmplitudeEvent)e);
+                            apiCallsToSend.Add(ev);
                         }
                     }
 
-                    if (eventsToSend.Count > 0)
-                    {
-                        AmplitudeApi.SendResult result = await api.SendEvents(eventsToSend);
-
-                        if (result == AmplitudeApi.SendResult.Success || result == AmplitudeApi.SendResult.ServerError)
+                    if (apiCallsToSend.Count > 0)
+                    { 
+                        // A little ugly, but we need to call different parts of the API, yet handle the response the same way
+                        AmplitudeApi.SendResult result;
+                        AmplitudeIdentify identification;
+                        if ((identification = apiCallsToSend[0] as AmplitudeIdentify) != null)
                         {
-                            // Remove these events from the list:
-                            lock (lockObject)
-                            {
-                                eventQueue.RemoveRange(0, eventsToSend.Count);
-                            }
+                            result = await api.Identify(identification);
                         }
                         else
                         {
-                            // If we failed to send events don't sent the identification:
-                            identification = null;
-                            backOff = true;
+                            result = await api.SendEvents(apiCallsToSend.Cast<AmplitudeEvent>());
                         }
-                    }
 
-                    if (identification != null)
-                    {
-                        AmplitudeApi.SendResult result = await api.Identify(identification);
-
-                        if (result == AmplitudeApi.SendResult.Success || result == AmplitudeApi.SendResult.ServerError)
+                        lock (lockObject)
                         {
-                            // Remove this identify call from the list
-                            lock (lockObject)
+                            if (result == AmplitudeApi.SendResult.Success)
                             {
-                                eventQueue.RemoveRange(0, 1);
+                                // Success. Can remove those events from queue
+                                eventQueue.RemoveRange(0, apiCallsToSend.Count);
                             }
-                        }
-                        else
-                        {
-                            backOff = true;
+                            else if (result == IAmplitudeApi.SendResult.BadData)
+                            {
+                                // TODO: For now, we also remove these from the list. In future we want to get the index of the
+                                // events in the batch which failed and then only remove those from the queue.
+                                eventQueue.RemoveRange(0, apiCallsToSend.Count);
+                            }
+                            else if (result == IAmplitudeApi.SendResult.InvalidApiKey)
+                            {
+                                // We cannot recover from this. The best we can do is save any events to the queue and hope for a
+                                // new key API next time. We log the error, and then shutdown this thread.
+                                s_logger(LogLevel.Error, $"Amplitude returned invalid API key. Further API calls will not be sent");
+                                return;
+                            }
+                            else if (result == IAmplitudeApi.SendResult.TooLarge)
+                            {
+                                // Events only. For identity we cant reduce the batch size
+                                if (identification == null)
+                                {
+                                    // If our payload was too large, we assume that future payloads also might be too large and hit
+                                    // the cap. We reduce the batch size if possible and try again. If we are already at size 1,
+                                    // then we have a problem.
+                                    if (maxEventBatch > 0)
+                                    {
+                                        maxEventBatch = maxEventBatch / 2;
+                                    }
+                                    else
+                                    {
+                                        // Event was too large. Remove the event and continue
+                                        s_logger(LogLevel.Error, $"Event data was too large for Amplitude (EventId = {((AmplitudeEvent)apiCallsToSend[0]).EventId})");
+                                        eventQueue.RemoveRange(0, apiCallsToSend.Count);
+                                    }
+                                }
+                                else
+                                {
+                                    s_logger(LogLevel.Error, $"Identify data was too large for Amplitude");
+                                    eventQueue.RemoveRange(0, apiCallsToSend.Count);
+                                }
+                            }
+                            else if (result == IAmplitudeApi.SendResult.Throttled)
+                            {
+                                if (result == IAmplitudeApi.SendResult.Throttled)
+                                {
+                                    s_logger(LogLevel.Warning, $"Amplitude is throttling API calls");
+                                }
+                                backOff = true;
+                            }
+                            else if (result == IAmplitudeApi.SendResult.ServerError)
+                            {
+                                // We treat retryable server errors in the same way as a throttle. Retry in a bit
+                                backOff = true;
+                            }
                         }
                     }
 
