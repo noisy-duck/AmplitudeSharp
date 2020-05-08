@@ -7,7 +7,7 @@ namespace AmplitudeSharp
 {
     public class DeviceProperties
     {
-        [JsonProperty(propertyName:"device_id")]
+        [JsonProperty(propertyName: "device_id")]
         public string DeviceId { get; set; }
 
         [JsonProperty(propertyName: "platform")]
@@ -29,11 +29,11 @@ namespace AmplitudeSharp
         public string Language { get; set; }
 
         [JsonIgnore]
-        public bool Is64BitDevice
+        public bool? Is64BitDevice
         {
             get
             {
-                return (bool)ExtraProperties.TryGet("64bit_device");
+                return (bool?)ExtraProperties.TryGet("64bit_device");
             }
             set
             {
@@ -42,11 +42,11 @@ namespace AmplitudeSharp
         }
 
         [JsonIgnore]
-        public ulong RamMbs
+        public ulong? RamMbs
         {
             get
             {
-                return (ulong)ExtraProperties.TryGet("ram_mbs");
+                return (ulong?)ExtraProperties.TryGet("ram_mbs");
             }
             set
             {
@@ -72,18 +72,29 @@ namespace AmplitudeSharp
 
         public DeviceProperties()
         {
-            DeviceHelper deviceHelper = new DeviceHelper();
             ExtraProperties = new Dictionary<string, object>();
+        }
 
-            Platform = OSName = "Windows";
-            OSVersion = deviceHelper.OSVersion;
-            DeviceModel = deviceHelper.Model;
-            DeviceManufacturer = deviceHelper.Manufacturer;
-            // TODO(revive): Revive this once .NET Core 3.0 is released
-//            NetFrameworkVersion = NetFxHelper.GetNetFxVersion().ToString();
-            RamMbs = deviceHelper.RamMbs;
-            Is64BitDevice = deviceHelper.Is64BitDevice;
-            Language = Thread.CurrentThread.CurrentUICulture.EnglishName;
+        /// <summary>
+        /// Returns a new DeviceProperties object populated from the current device.
+        /// </summary>
+        public static DeviceProperties FromCurrentDevice()
+        {
+            DeviceHelper deviceHelper = new DeviceHelper();
+
+            return new DeviceProperties()
+            {
+                Platform = "Windows",
+                OSName = "Windows",
+                OSVersion = deviceHelper.OSVersion,
+                DeviceModel = deviceHelper.Model,
+                DeviceManufacturer = deviceHelper.Manufacturer,
+                // TODO(revive): Revive this once .NET Core 3.0 is released
+                //            NetFrameworkVersion = NetFxHelper.GetNetFxVersion().ToString();
+                RamMbs = deviceHelper.RamMbs,
+                Is64BitDevice = deviceHelper.Is64BitDevice,
+                Language = Thread.CurrentThread.CurrentUICulture.EnglishName,
+            };
         }
     }
 }

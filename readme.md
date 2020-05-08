@@ -55,7 +55,7 @@ userProps.ExtraProperties.Add("email", "test2@example.com");
 // userProps.AppVersion = Assembly.GetExecutingAssembly().GetName().Version.ToString();
 
 // Setup our device properties:
-DeviceProperties devProps = new DeviceProperties();
+DeviceProperties devProps = DeviceProperties.FromCurrentDevice();
 // It's a good idea to set a device ID, that way you can tell how many devices
 // a give user uses. Best way is to generate a device ID on first start and stash it
 // in the settings of the app
