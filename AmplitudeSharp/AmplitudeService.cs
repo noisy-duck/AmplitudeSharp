@@ -326,8 +326,8 @@ namespace AmplitudeSharp
                             else if (result == IAmplitudeApi.SendResult.InvalidApiKey)
                             {
                                 // We cannot recover from this. The best we can do is save any events to the queue and hope for a
-                                // new key API next time. We log the error, and then shutdown this thread.
-                                s_logger(LogLevel.Error, $"Amplitude returned invalid API key. Further API calls will not be sent");
+                                // new key API next time. We log the event, and then shutdown this thread.
+                                s_logger(LogLevel.Error, $"Amplitude API returned invalid API key. Further API calls will not be sent");
                                 return;
                             }
                             else if (result == IAmplitudeApi.SendResult.TooLarge)
@@ -373,6 +373,7 @@ namespace AmplitudeSharp
 
                     if (backOff)
                     {
+                        // 30s recommended by Amupltidue docs as backup time for throttling
                         await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken.Token);
                     }
                 }

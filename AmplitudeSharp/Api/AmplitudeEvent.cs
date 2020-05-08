@@ -113,6 +113,8 @@ namespace AmplitudeSharp.Api
             this["library"] = $"{nameof(AmplitudeSharp)}/{LibraryVersion}";
             this["ip"] = "$remote";
 
+            this["insert_id"] = Guid.NewGuid().ToString("N");
+
             if (extraEventProps != null && extraEventProps.Count > 0)
             {
                 if (Properties == null)
