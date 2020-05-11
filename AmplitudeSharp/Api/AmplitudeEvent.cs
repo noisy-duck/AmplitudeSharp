@@ -57,11 +57,11 @@ namespace AmplitudeSharp.Api
         }
 
         [JsonIgnore]
-        public long Time
+        public long? Time
         {
             get
             {
-                return (long)this.TryGet("time");
+                return (long?)this.TryGet("time");
             }
             set
             {

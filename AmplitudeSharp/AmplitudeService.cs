@@ -27,6 +27,7 @@ namespace AmplitudeSharp
         private AmplitudeIdentify identification;
         private readonly SemaphoreSlim eventsReady;
         private long sessionId = -1;
+        private readonly AmplitudeServiceSettings settings;
         private readonly JsonSerializerSettings apiJsonSerializerSettings = new JsonSerializerSettings
         {
             NullValueHandling = NullValueHandling.Ignore,
@@ -54,9 +55,13 @@ namespace AmplitudeSharp
         /// </summary>
         public Dictionary<string, object> ExtraEventProperties { get; } = new Dictionary<string, object>();
 
-        private AmplitudeService(string apiKey)
+        private AmplitudeService(string apiKey, AmplitudeServiceSettings settings = null)
         {
             lockObject = new object();
+
+            // Use default settings if none given
+            this.settings = settings ?? new AmplitudeServiceSettings();
+            
             api = new AmplitudeApi(apiKey, apiJsonSerializerSettings);
             eventQueue = new List<IAmplitudeEvent>();
             cancellationToken = new CancellationTokenSource();
@@ -77,15 +82,17 @@ namespace AmplitudeSharp
         /// <param name="apiKey">api key for the project to stream data to</param>
         /// <param name="persistenceStream">optional, stream with saved event data <seealso cref="Uninitialize(Stream)"/></param>
         /// <param name="logger">Action delegate for logging purposes, if none is specified <see cref="System.Diagnostics.Debug.WriteLine(object)"/> is used</param>
+        /// <param name="settings">Settings to customize how the Amplitude service operates.</param>
         /// <returns></returns>
-        public static AmplitudeService Initialize(string apiKey, Action<LogLevel, string> logger = null, Stream persistenceStream = null)
+        public static AmplitudeService Initialize(string apiKey, Action<LogLevel, string> logger = null, Stream persistenceStream = null, AmplitudeServiceSettings settings = null)
         {
+            // Deliberately catch the example key (stops copy/paste error from docs)
             if (apiKey == "<YOUR_API_KEY>")
             {
                 throw new ArgumentOutOfRangeException(nameof(apiKey), "Please specify Amplitude API key");
             }
 
-            AmplitudeService instance = new AmplitudeService(apiKey);
+            AmplitudeService instance = new AmplitudeService(apiKey, settings);
             instance.NewSession();
 
             if (Interlocked.CompareExchange(ref s_instance, instance, null) == null)
@@ -280,14 +287,25 @@ namespace AmplitudeSharp
                 {
                     await eventsReady.WaitAsync(cancellationToken.Token);
 
+                    // We have some events to dispatch. We might want to wait for more if mobile to group together
+                    if (settings.DispatchBatchPeriodSeconds > 0 && eventQueue.Any())
+                    {
+                        await Task.Delay(TimeSpan.FromSeconds(settings.DispatchBatchPeriodSeconds), cancellationToken.Token);
+                    }
+
                     List<IAmplitudeEvent> apiCallsToSend = new List<IAmplitudeEvent>();
                     bool backOff = false;
 
                     lock (lockObject)
                     {
+                        // Remove any events that have been queued for too long (could include previously persisted events)
+                        var now = DateTime.UtcNow.ToUnixEpoch();
+                        var removed = eventQueue.RemoveAll(ev => ev is AmplitudeEvent && 
+                            ((AmplitudeEvent)ev).Time + (settings.QueuedApiCallsTTLSeconds * 1000) < now);
+
+                        // Events API supports bacthing, so grab a few (but stop if we get to an identify - different API)
                         foreach (IAmplitudeEvent ev in eventQueue)
                         {
-                            // Events API supports bacthing, so grab a few (stop if we get to an identify - different API)
                             if ((apiCallsToSend.Count > 0 && ev is AmplitudeIdentify) || (apiCallsToSend.Count >= maxEventBatch))
                             {
                                 break;
@@ -374,7 +392,7 @@ namespace AmplitudeSharp
                     if (backOff)
                     {
                         // 30s recommended by Amupltidue docs as backup time for throttling
-                        await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken.Token);
+                        await Task.Delay(TimeSpan.FromSeconds(settings.BackOffDelaySeconds), cancellationToken.Token);
                     }
                 }
             }

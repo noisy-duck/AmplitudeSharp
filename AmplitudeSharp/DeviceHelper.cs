@@ -25,6 +25,7 @@ namespace AmplitudeSharp
         public bool Is64BitDevice { get; }
         public string OSName { get; }
         public string OSVersion { get; }
+        public bool IsMobile { get; }
 
         internal DeviceHelper()
         {
@@ -60,7 +61,8 @@ namespace AmplitudeSharp
                 AmplitudeService.s_logger(LogLevel.Warning, $"Failed to get OS Version from WMI, using Environment which may not be accurate: {ex.ToString()}");
             }
 
-            string majorMinor = new Version(OSVersion).ToString(2);
+            // Might not get one on mobile. We can do this properly when we fix this class
+            string majorMinor = !String.IsNullOrEmpty(OSVersion) ? new Version(OSVersion).ToString(2) : String.Empty;
             OSName = WindowsVersions.TryGet(majorMinor, "Windows");
 
             try
@@ -78,6 +80,9 @@ namespace AmplitudeSharp
             }
 
             Is64BitDevice = Environment.Is64BitOperatingSystem;
+
+            // TODO: Implement this when we add mobile support here
+            IsMobile = false;
         }
     }
 }
