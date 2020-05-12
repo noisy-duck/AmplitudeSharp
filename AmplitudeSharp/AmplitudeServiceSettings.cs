@@ -7,8 +7,8 @@ namespace AmplitudeSharp
 	public class AmplitudeServiceSettings
 	{
 		/// <summary>
-		/// The number of seconds to wait before retry if the Amuplitude API returns an error or throttle.
-		/// Default value of 30s recommended by Amlitude docs.
+		/// The number of seconds to wait before retry if the Amplitude API returns an error or throttles us.
+		/// Default value of 30s recommended by Amplitude docs.
 		/// </summary>
 		public uint BackOffDelaySeconds = 30;
 
@@ -25,6 +25,14 @@ namespace AmplitudeSharp
 		/// event is unique if it get's replayed (insert_id validity is 7 days for events API).
 		/// </summary>
 		public uint QueuedApiCallsTTLSeconds = 60 * 60 * 24 * 7;
+
+		/// <summary>
+		/// The time period between background saves of the event queue. Ensures we persist any outstanding
+		/// events in the event of a crash, or on environments where we may not have full control of the
+		/// application lifecycle. Will not write if there is no new data to write. Setting to 0 will disable
+		/// background writes (the persistence store will still be used on startup / exit).
+		/// </summary>
+		public uint BackgroundWritePeriodSeconds = 3;
 
 		public AmplitudeServiceSettings()
 		{

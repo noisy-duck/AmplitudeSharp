@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using AmplitudeSharp.Api;
@@ -21,12 +22,15 @@ namespace AmplitudeSharp
 
         private readonly object lockObject;
         private readonly List<IAmplitudeEvent> eventQueue;
+        private bool eventQueueDirty;
         private readonly CancellationTokenSource cancellationToken;
         private Thread sendThread;
+        private Thread persistenceThread;
         private readonly AmplitudeApi api;
         private AmplitudeIdentify identification;
         private readonly SemaphoreSlim eventsReady;
         private long sessionId = -1;
+        private readonly Stream persistenceStream;
         private readonly AmplitudeServiceSettings settings;
         private readonly JsonSerializerSettings apiJsonSerializerSettings = new JsonSerializerSettings
         {
@@ -55,17 +59,23 @@ namespace AmplitudeSharp
         /// </summary>
         public Dictionary<string, object> ExtraEventProperties { get; } = new Dictionary<string, object>();
 
-        private AmplitudeService(string apiKey, AmplitudeServiceSettings settings = null)
+        private AmplitudeService(string apiKey, Stream persistenceStream = null, AmplitudeServiceSettings settings = null)
         {
             lockObject = new object();
 
             // Use default settings if none given
             this.settings = settings ?? new AmplitudeServiceSettings();
-            
+
             api = new AmplitudeApi(apiKey, apiJsonSerializerSettings);
             eventQueue = new List<IAmplitudeEvent>();
             cancellationToken = new CancellationTokenSource();
             eventsReady = new SemaphoreSlim(0);
+
+            if (persistenceStream != null)
+            {
+                this.persistenceStream = persistenceStream;
+                LoadPastEvents();
+            }
         }
 
         public void Dispose()
@@ -80,7 +90,7 @@ namespace AmplitudeSharp
         /// a stream where offline/past events are stored
         /// </summary>
         /// <param name="apiKey">api key for the project to stream data to</param>
-        /// <param name="persistenceStream">optional, stream with saved event data <seealso cref="Uninitialize(Stream)"/></param>
+        /// <param name="persistenceStream">optional, stream to persist/restore saved event data. This is written to periodically and should exlusive to the service.</param>
         /// <param name="logger">Action delegate for logging purposes, if none is specified <see cref="System.Diagnostics.Debug.WriteLine(object)"/> is used</param>
         /// <param name="settings">Settings to customize how the Amplitude service operates.</param>
         /// <returns></returns>
@@ -92,7 +102,7 @@ namespace AmplitudeSharp
                 throw new ArgumentOutOfRangeException(nameof(apiKey), "Please specify Amplitude API key");
             }
 
-            AmplitudeService instance = new AmplitudeService(apiKey, settings);
+            AmplitudeService instance = new AmplitudeService(apiKey, persistenceStream, settings);
             instance.NewSession();
 
             if (Interlocked.CompareExchange(ref s_instance, instance, null) == null)
@@ -104,21 +114,17 @@ namespace AmplitudeSharp
 
                 s_logger = logger;
 
-                instance.StartSendThread();
-
-                if (persistenceStream != null)
-                {
-                    instance.LoadPastEvents(persistenceStream);
-                }
+                instance.StartBackgroundThreads();
             }
 
             return Instance;
         }
 
-        public void Uninitialize(Stream persistenceStore = null)
+        public void Uninitialize()
         {
             cancellationToken.Cancel();
-            SaveEvents(persistenceStore);
+            // Force an immediate save outside our persistence thread
+            SaveEvents();
         }
 
         /// <summary>
@@ -186,7 +192,7 @@ namespace AmplitudeSharp
         /// </summary>
         /// <param name="eventName">the name of the event</param>
         /// <param name="properties">parameters for the event (this can just be a dynamic class)</param>
-        public void Track(string eventName, object properties = null )
+        public void Track(string eventName, object properties = null)
         {
             var identification = this.identification;
 
@@ -217,53 +223,87 @@ namespace AmplitudeSharp
             lock (lockObject)
             {
                 eventQueue.Add(e);
+
+                eventQueueDirty = true;
             }
 
             eventsReady.Release();
         }
 
-        private void SaveEvents(Stream persistenceStore)
-        {
-            if (persistenceStore != null)
-            {
-                try
-                {
-                    string persistedData = JsonConvert.SerializeObject(eventQueue, persistenceJsonSerializerSettings);
-                    using (var writer = new StreamWriter(persistenceStore))
-                    {
-                        writer.Write(persistedData);
-                    }
-                }
-                catch (Exception e)
-                {
-                    AmplitudeService.s_logger(LogLevel.Error, $"Failed to persist events: {e}");
-                }
-            }
-        }
-
-        private void LoadPastEvents(Stream persistenceStore)
+        private void SaveEvents()
         {
             try
             {
-                using (var reader = new StreamReader(persistenceStore))
+                // We don't need to write anything in the common case that the event has been sent to the API before our 
+                // save interval has expired. However, if there are already existing events in the store, we would need to
+                // clear them. We can check this by seeing if our stream position is > 0 (i.e. it had some content previously).
+                if (eventQueue.Any() || persistenceStream.Position > 0)
                 {
-                    string persistedData = reader.ReadLine();
-                    var data = JsonConvert.DeserializeObject<List<IAmplitudeEvent>>(persistedData, persistenceJsonSerializerSettings);
+                    String persistedData;
+                    lock (lockObject)
+                    {
+                        persistedData = JsonConvert.SerializeObject(eventQueue, persistenceJsonSerializerSettings);
+                        // Dirty flag is just an optimisation so we write less. Doesn't matter if we save events that our upload
+                        // thread has since dispatched. We will update the store next cycle. If we crash, all our events have 
+                        // insert_id's so they are fine to replay.
+                        eventQueueDirty = false;
+                    }
+                    lock (persistenceStream)
+                    {
+                        // Reset us back to the start and truncate content (incase new data is shorter)
+                        persistenceStream.Seek(0, SeekOrigin.Begin);
+                        persistenceStream.SetLength(0);
 
-                    eventQueue.InsertRange(0, data);
-                    eventsReady.Release();
+                        using (var writer = new StreamWriter(persistenceStream, Encoding.UTF8, 1024, true))
+                        {
+                            writer.Write(persistedData);
+                        }
+
+                        persistenceStream.Flush();
+                    }
                 }
             }
             catch (Exception e)
             {
+                AmplitudeService.s_logger(LogLevel.Error, $"Failed to persist events: {e}");
+            }
+        }
+
+        private void LoadPastEvents()
+        {
+            try
+            {
+                lock (persistenceStream)
+                {
+                    using (var reader = new StreamReader(persistenceStream, Encoding.UTF8, false, 1024, true))
+                    {
+                        string persistedData = reader.ReadLine();
+                        if (!String.IsNullOrEmpty(persistedData))
+                        {
+                            var data = JsonConvert.DeserializeObject<List<IAmplitudeEvent>>(persistedData, persistenceJsonSerializerSettings);
+                            if(data.Any())
+                            { 
+                                lock (lockObject)
+                                {
+                                    eventQueue.InsertRange(0, data);
+                                }
+                                eventsReady.Release();
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                // We are safe to continue, we just won't have any of the previously saved data
                 s_logger(LogLevel.Error, $"Failed to load persisted events: {e}");
             }
         }
 
         /// <summary>
-        /// Configure and kick-off the background upload thread
+        /// Configure and kick-off the background upload and persistence threads.
         /// </summary>
-        private void StartSendThread()
+        private void StartBackgroundThreads()
         {
             sendThread = new Thread(UploadThread)
             {
@@ -271,6 +311,16 @@ namespace AmplitudeSharp
                 Priority = ThreadPriority.BelowNormal,
             };
             sendThread.Start();
+
+            if (settings.BackgroundWritePeriodSeconds > 0)
+            {
+                persistenceThread = new Thread(PersistenceThread)
+                {
+                    Name = $"{nameof(AmplitudeSharp)} Persistence Thread",
+                    Priority = ThreadPriority.BelowNormal,
+                };
+                persistenceThread.Start();
+            }
         }
 
         /// <summary>
@@ -300,7 +350,7 @@ namespace AmplitudeSharp
                     {
                         // Remove any events that have been queued for too long (could include previously persisted events)
                         var now = DateTime.UtcNow.ToUnixEpoch();
-                        var removed = eventQueue.RemoveAll(ev => ev is AmplitudeEvent && 
+                        var removed = eventQueue.RemoveAll(ev => ev is AmplitudeEvent &&
                             ((AmplitudeEvent)ev).Time + (settings.QueuedApiCallsTTLSeconds * 1000) < now);
 
                         // Events API supports bacthing, so grab a few (but stop if we get to an identify - different API)
@@ -315,7 +365,7 @@ namespace AmplitudeSharp
                     }
 
                     if (apiCallsToSend.Count > 0)
-                    { 
+                    {
                         // A little ugly, but we need to call different parts of the API, yet handle the response the same way
                         AmplitudeApi.SendResult result;
                         AmplitudeIdentify identification;
@@ -328,64 +378,61 @@ namespace AmplitudeSharp
                             result = await api.SendEvents(apiCallsToSend.Cast<AmplitudeEvent>());
                         }
 
-                        lock (lockObject)
+                        if (result == AmplitudeApi.SendResult.Success)
                         {
-                            if (result == AmplitudeApi.SendResult.Success)
+                            // Success. Can remove those events from queue
+                            EventQueueRemove(apiCallsToSend.Count);
+                        }
+                        else if (result == IAmplitudeApi.SendResult.BadData)
+                        {
+                            // TODO: For now, we also remove these from the list. In future we want to get the index of the
+                            // events in the batch which failed and then only remove those from the queue.
+                            EventQueueRemove(apiCallsToSend.Count);
+                        }
+                        else if (result == IAmplitudeApi.SendResult.InvalidApiKey)
+                        {
+                            // We cannot recover from this. The best we can do is save any events to the queue and hope for a
+                            // new key API next time. We log the event, and then shutdown this thread.
+                            s_logger(LogLevel.Error, $"Amplitude API returned invalid API key. Further API calls will not be sent");
+                            return;
+                        }
+                        else if (result == IAmplitudeApi.SendResult.TooLarge)
+                        {
+                            // Events only. For identity we cant reduce the batch size
+                            if (identification == null)
                             {
-                                // Success. Can remove those events from queue
-                                eventQueue.RemoveRange(0, apiCallsToSend.Count);
-                            }
-                            else if (result == IAmplitudeApi.SendResult.BadData)
-                            {
-                                // TODO: For now, we also remove these from the list. In future we want to get the index of the
-                                // events in the batch which failed and then only remove those from the queue.
-                                eventQueue.RemoveRange(0, apiCallsToSend.Count);
-                            }
-                            else if (result == IAmplitudeApi.SendResult.InvalidApiKey)
-                            {
-                                // We cannot recover from this. The best we can do is save any events to the queue and hope for a
-                                // new key API next time. We log the event, and then shutdown this thread.
-                                s_logger(LogLevel.Error, $"Amplitude API returned invalid API key. Further API calls will not be sent");
-                                return;
-                            }
-                            else if (result == IAmplitudeApi.SendResult.TooLarge)
-                            {
-                                // Events only. For identity we cant reduce the batch size
-                                if (identification == null)
+                                // If our payload was too large, we assume that future payloads also might be too large and hit
+                                // the cap. We reduce the batch size if possible and try again. If we are already at size 1,
+                                // then we have a problem.
+                                if (maxEventBatch > 0)
                                 {
-                                    // If our payload was too large, we assume that future payloads also might be too large and hit
-                                    // the cap. We reduce the batch size if possible and try again. If we are already at size 1,
-                                    // then we have a problem.
-                                    if (maxEventBatch > 0)
-                                    {
-                                        maxEventBatch = maxEventBatch / 2;
-                                    }
-                                    else
-                                    {
-                                        // Event was too large. Remove the event and continue
-                                        s_logger(LogLevel.Error, $"Event data was too large for Amplitude (EventId = {((AmplitudeEvent)apiCallsToSend[0]).EventId})");
-                                        eventQueue.RemoveRange(0, apiCallsToSend.Count);
-                                    }
+                                    maxEventBatch = maxEventBatch / 2;
                                 }
                                 else
                                 {
-                                    s_logger(LogLevel.Error, $"Identify data was too large for Amplitude");
-                                    eventQueue.RemoveRange(0, apiCallsToSend.Count);
+                                    // Event was too large. Remove the event and continue
+                                    s_logger(LogLevel.Error, $"Event data was too large for Amplitude (EventId = {((AmplitudeEvent)apiCallsToSend[0]).EventId})");
+                                    EventQueueRemove(apiCallsToSend.Count);
                                 }
                             }
-                            else if (result == IAmplitudeApi.SendResult.Throttled)
+                            else
                             {
-                                if (result == IAmplitudeApi.SendResult.Throttled)
-                                {
-                                    s_logger(LogLevel.Warning, $"Amplitude is throttling API calls");
-                                }
-                                backOff = true;
+                                s_logger(LogLevel.Error, $"Identify data was too large for Amplitude");
+                                EventQueueRemove(apiCallsToSend.Count);
                             }
-                            else if (result == IAmplitudeApi.SendResult.ServerError)
+                        }
+                        else if (result == IAmplitudeApi.SendResult.Throttled)
+                        {
+                            if (result == IAmplitudeApi.SendResult.Throttled)
                             {
-                                // We treat retryable server errors in the same way as a throttle. Retry in a bit
-                                backOff = true;
+                                s_logger(LogLevel.Warning, $"Amplitude is throttling API calls");
                             }
+                            backOff = true;
+                        }
+                        else if (result == IAmplitudeApi.SendResult.ServerError)
+                        {
+                            // We treat retryable server errors in the same way as a throttle. Retry in a bit
+                            backOff = true;
                         }
                     }
 
@@ -403,6 +450,47 @@ namespace AmplitudeSharp
             {
                 // No matter what exception happens, we just quit
                 s_logger(LogLevel.Error, "Upload thread terminated with: " + e);
+            }
+        }
+
+        /// <summary>
+        /// Removes the given number of API calls from the pending event queue (in a thread safe way).
+        /// </summary>
+        private void EventQueueRemove(int numberToRemove)
+        {
+            lock(lockObject)
+            {
+                eventQueue.RemoveRange(0, numberToRemove);
+
+                eventQueueDirty = true;
+            }
+        }
+
+        /// <summary>
+        /// The background thread for persisting event state.
+        /// </summary>
+        private async void PersistenceThread()
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(settings.BackgroundWritePeriodSeconds), cancellationToken.Token);
+
+                    if (eventQueueDirty)
+                    {
+                        // Will mark queue as non dirty
+                        SaveEvents();
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception e)
+            {
+                // No matter what exception happens, we just quit
+                s_logger(LogLevel.Error, "Persistence thread terminated with: " + e);
             }
         }
     }
