@@ -107,6 +107,8 @@ namespace AmplitudeSharp
 
             if (Interlocked.CompareExchange(ref s_instance, instance, null) == null)
             {
+                // TODO: Re-write the logger to be instance. The static dependency is a bit icky 
+                // and means we can't log anything until here (after creation and new session!)
                 if (logger == null)
                 {
                     logger = (level, message) => { System.Diagnostics.Debug.WriteLine($"Analytics: [{level}] {message}"); };
@@ -185,7 +187,6 @@ namespace AmplitudeSharp
         {
             sessionId = DateTime.UtcNow.ToUnixEpoch();
         }
-
 
         /// <summary>
         /// Log an event with parameters
@@ -287,6 +288,9 @@ namespace AmplitudeSharp
                                 {
                                     eventQueue.InsertRange(0, data);
                                 }
+
+                                s_logger(LogLevel.Informational, $"Restored {data.Count} events from previous session");
+
                                 eventsReady.Release();
                             }
                         }
@@ -353,12 +357,19 @@ namespace AmplitudeSharp
                         var removed = eventQueue.RemoveAll(ev => ev is AmplitudeEvent &&
                             ((AmplitudeEvent)ev).Time + (settings.QueuedApiCallsTTLSeconds * 1000) < now);
 
-                        // Events API supports bacthing, so grab a few (but stop if we get to an identify - different API)
+                        if(removed > 0)
+                        {
+                            s_logger(LogLevel.Informational, $"Removed {removed} expired events from event queue");
+                        }
+
+                        // Events API supports bacthing, so grab a few of the same time (except identify, which is one at a time)
                         foreach (IAmplitudeEvent ev in eventQueue)
                         {
-                            if ((apiCallsToSend.Count > 0 && ev is AmplitudeIdentify) || (apiCallsToSend.Count >= maxEventBatch))
+                            if(apiCallsToSend.Any())
                             {
-                                break;
+                                if (ev.GetType() != apiCallsToSend.First().GetType()) break;    // Type change (e.g. event then identify)
+                                if (ev is AmplitudeIdentify) break;                             // An identify, and we already have something (they are singular                                
+                                if (apiCallsToSend.Count >= maxEventBatch) break;               // Max batch size of queue
                             }
                             apiCallsToSend.Add(ev);
                         }
