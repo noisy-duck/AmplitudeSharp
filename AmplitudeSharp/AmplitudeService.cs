@@ -102,20 +102,20 @@ namespace AmplitudeSharp
                 throw new ArgumentOutOfRangeException(nameof(apiKey), "Please specify Amplitude API key");
             }
 
+            // TODO: Re-write the logger to be instance. The static dependency is a bit icky 
+            // and we don't check when overwriting it if we make a second instance.
+            // Setup logger first thing, so we can log if creation failed
+            if (logger == null)
+            {
+                logger = (level, message) => { System.Diagnostics.Debug.WriteLine($"Analytics: [{level}] {message}"); };
+            }
+            s_logger = logger;
+
             AmplitudeService instance = new AmplitudeService(apiKey, persistenceStream, settings);
             instance.NewSession();
 
             if (Interlocked.CompareExchange(ref s_instance, instance, null) == null)
             {
-                // TODO: Re-write the logger to be instance. The static dependency is a bit icky 
-                // and means we can't log anything until here (after creation and new session!)
-                if (logger == null)
-                {
-                    logger = (level, message) => { System.Diagnostics.Debug.WriteLine($"Analytics: [{level}] {message}"); };
-                }
-
-                s_logger = logger;
-
                 instance.StartBackgroundThreads();
             }
 
@@ -231,7 +231,11 @@ namespace AmplitudeSharp
             eventsReady.Release();
         }
 
-        private void SaveEvents()
+        /// <summary>
+        /// Saves any events that have not yet been send. Is called periodically automatically, but can also
+        /// be called manually for force a save (for example, if the app is about to exit).
+        /// </summary>
+        public void SaveEvents()
         {
             try
             {
