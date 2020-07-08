@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 // TODO(revive): Revive this once .NET Core 3.0 is released
 //using System.Management;
 using AmplitudeSharp.Utils;
@@ -28,7 +29,7 @@ namespace AmplitudeSharp
         public bool IsMobile { get; }
 
         internal DeviceHelper()
-        {
+        {   
             try
             {
                 // TODO(revive): Revive this once .NET Core 3.0 is released
@@ -65,19 +66,24 @@ namespace AmplitudeSharp
             string majorMinor = !String.IsNullOrEmpty(OSVersion) ? new Version(OSVersion).ToString(2) : String.Empty;
             OSName = WindowsVersions.TryGet(majorMinor, "Windows");
 
-            try
+            // Disabled this as it crashed on non Windows platforms. We should redo this a different way when we update this device class to be cross platform
+            // Do we even care about Ram stats most the time? Consuemrs that do can always re-query it.
+            /*if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                var memStatus = new NativeMethods.MEMORYSTATUSEX();
-                if (NativeMethods.GlobalMemoryStatusEx(memStatus))
+                try
                 {
-                    // Round to nearest 0.5GB
-                    RamMbs = (ulong)Math.Round((memStatus.ullTotalPhys >> 20) / 512.0) * 512;
+                    var memStatus = new NativeMethods.MEMORYSTATUSEX();
+                    if (NativeMethods.GlobalMemoryStatusEx(memStatus))
+                    {
+                        // Round to nearest 0.5GB
+                        RamMbs = (ulong)Math.Round((memStatus.ullTotalPhys >> 20) / 512.0) * 512;
+                    }
                 }
-            }
-            catch (Exception ex)
-            {
-                AmplitudeService.s_logger(LogLevel.Warning, $"Failed to get device RAM size: {ex}");
-            }
+                catch (Exception ex)
+                {
+                    AmplitudeService.s_logger(LogLevel.Warning, $"Failed to get device RAM size: {ex}");
+                }
+            }*/
 
             Is64BitDevice = Environment.Is64BitOperatingSystem;
 
