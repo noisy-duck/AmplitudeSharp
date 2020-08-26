@@ -237,40 +237,44 @@ namespace AmplitudeSharp
         /// </summary>
         public void SaveEvents()
         {
-            try
+            // If we don't have a stream we can ignore
+            if (persistenceStream != null)
             {
-                // We don't need to write anything in the common case that the event has been sent to the API before our 
-                // save interval has expired. However, if there are already existing events in the store, we would need to
-                // clear them. We can check this by seeing if our stream position is > 0 (i.e. it had some content previously).
-                if (eventQueue.Any() || persistenceStream.Position > 0)
+                try
                 {
-                    String persistedData;
-                    lock (lockObject)
+                    // We don't need to write anything in the common case that the event has been sent to the API before our 
+                    // save interval has expired. However, if there are already existing events in the store, we would need to
+                    // clear them. We can check this by seeing if our stream position is > 0 (i.e. it had some content previously).
+                    if (eventQueue.Any() || persistenceStream.Position > 0)
                     {
-                        persistedData = JsonConvert.SerializeObject(eventQueue, persistenceJsonSerializerSettings);
-                        // Dirty flag is just an optimisation so we write less. Doesn't matter if we save events that our upload
-                        // thread has since dispatched. We will update the store next cycle. If we crash, all our events have 
-                        // insert_id's so they are fine to replay.
-                        eventQueueDirty = false;
-                    }
-                    lock (persistenceStream)
-                    {
-                        // Reset us back to the start and truncate content (incase new data is shorter)
-                        persistenceStream.Seek(0, SeekOrigin.Begin);
-                        persistenceStream.SetLength(0);
-
-                        using (var writer = new StreamWriter(persistenceStream, Encoding.UTF8, 1024, true))
+                        String persistedData;
+                        lock (lockObject)
                         {
-                            writer.Write(persistedData);
+                            persistedData = JsonConvert.SerializeObject(eventQueue, persistenceJsonSerializerSettings);
+                            // Dirty flag is just an optimisation so we write less. Doesn't matter if we save events that our upload
+                            // thread has since dispatched. We will update the store next cycle. If we crash, all our events have 
+                            // insert_id's so they are fine to replay.
+                            eventQueueDirty = false;
                         }
+                        lock (persistenceStream)
+                        {
+                            // Reset us back to the start and truncate content (incase new data is shorter)
+                            persistenceStream.Seek(0, SeekOrigin.Begin);
+                            persistenceStream.SetLength(0);
 
-                        persistenceStream.Flush();
+                            using (var writer = new StreamWriter(persistenceStream, Encoding.UTF8, 1024, true))
+                            {
+                                writer.Write(persistedData);
+                            }
+
+                            persistenceStream.Flush();
+                        }
                     }
                 }
-            }
-            catch (Exception e)
-            {
-                AmplitudeService.s_logger(LogLevel.Error, $"Failed to persist events: {e}");
+                catch (Exception e)
+                {
+                    AmplitudeService.s_logger(LogLevel.Error, $"Failed to persist events: {e}");
+                }
             }
         }
 
@@ -320,7 +324,7 @@ namespace AmplitudeSharp
             };
             sendThread.Start();
 
-            if (settings.BackgroundWritePeriodSeconds > 0)
+            if (settings.BackgroundWritePeriodSeconds > 0 && persistenceStream != null)
             {
                 persistenceThread = new Thread(PersistenceThread)
                 {
